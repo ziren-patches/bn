@@ -1,12 +1,13 @@
+use bytemuck::{AnyBitPattern, NoUninit};
 use core::cmp::Ordering;
-use rand::Rng;
 use crunchy::unroll;
+use rand::Rng;
 
 use byteorder::{BigEndian, ByteOrder};
 
 /// 256-bit, stack allocated biginteger for use in prime field
 /// arithmetic.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, NoUninit, AnyBitPattern)]
 #[repr(C)]
 pub struct U256(pub [u128; 2]);
 
@@ -79,7 +80,7 @@ impl U512 {
         U512(res)
     }
 
-     pub fn from_slice(s: &[u8]) -> Result<U512, Error> {
+    pub fn from_slice(s: &[u8]) -> Result<U512, Error> {
         if s.len() != 64 {
             return Err(Error::InvalidLength {
                 expected: 32,
@@ -151,14 +152,14 @@ impl Ord for U512 {
     #[inline]
     fn cmp(&self, other: &U512) -> Ordering {
         for (a, b) in self.0.iter().zip(other.0.iter()).rev() {
-            if *a < *b {
-                return Ordering::Less;
-            } else if *a > *b {
-                return Ordering::Greater;
+            match a.cmp(b) {
+                Ordering::Less => return Ordering::Less,
+                Ordering::Greater => return Ordering::Greater,
+                _ => {}
             }
         }
 
-        return Ordering::Equal;
+        Ordering::Equal
     }
 }
 
@@ -173,14 +174,13 @@ impl Ord for U256 {
     #[inline]
     fn cmp(&self, other: &U256) -> Ordering {
         for (a, b) in self.0.iter().zip(other.0.iter()).rev() {
-            if *a < *b {
-                return Ordering::Less;
-            } else if *a > *b {
-                return Ordering::Greater;
+            match a.cmp(b) {
+                Ordering::Less => return Ordering::Less,
+                Ordering::Greater => return Ordering::Greater,
+                _ => {}
             }
         }
-
-        return Ordering::Equal;
+        Ordering::Equal
     }
 }
 
@@ -200,34 +200,51 @@ pub enum Error {
 impl U256 {
     /// Initialize U256 from slice of bytes (big endian)
     pub fn from_slice(s: &[u8]) -> Result<U256, Error> {
-        if s.len() != 32 {
+        let mut padded = [0u8; 32];
+
+        if s.len() > 32 {
             return Err(Error::InvalidLength {
                 expected: 32,
                 actual: s.len(),
             });
         }
 
+        // Copy the input slice to the end of the padded array
+        padded[32 - s.len()..].copy_from_slice(s);
+
         let mut n = [0; 2];
         for (l, i) in (0..2).rev().zip((0..2).map(|i| i * 16)) {
-            n[l] = BigEndian::read_u128(&s[i..]);
+            n[l] = BigEndian::read_u128(&padded[i..]);
         }
-
         Ok(U256(n))
     }
 
     pub fn to_big_endian(&self, s: &mut [u8]) -> Result<(), Error> {
-        if s.len() != 32 {
+        if s.len() > 32 {
             return Err(Error::InvalidLength {
                 expected: 32,
                 actual: s.len(),
             });
         }
 
+        let mut padded = [0u8; 32];
+        let start = 32 - s.len();
+        padded[start..].copy_from_slice(s);
+
         for (l, i) in (0..2).rev().zip((0..2).map(|i| i * 16)) {
-            BigEndian::write_u128(&mut s[i..], self.0[l]);
+            BigEndian::write_u128(&mut padded[i..], self.0[l]);
         }
 
+        s.copy_from_slice(&padded[..s.len()]);
+
         Ok(())
+    }
+
+    pub fn to_bytes_be(&self) -> [u8; 32] {
+        let mut s = [0u8; 32];
+        self.to_big_endian(&mut s)
+            .expect("Unable to serialize U256 to bytes");
+        s
     }
 
     #[inline]
@@ -295,13 +312,36 @@ impl U256 {
         sub_noborrow(&mut self.0, &other.0);
     }
 
-    /// Multiply `self` by `other` (mod `modulo`) via the Montgomery
-    /// multiplication method.
-    pub fn mul(&mut self, other: &U256, modulo: &U256, inv: u128) {
-        mul_reduce(&mut self.0, &other.0, &modulo.0, inv);
+    pub(crate) fn cpu_mul(&mut self, other: &U256, modulo: &U256) {
+        let mut res = [0u128; 4];
 
-        if *self >= *modulo {
-            sub_noborrow(&mut self.0, &modulo.0);
+        unroll! {
+            for i in 0..2 {
+                mac_digit(i, &mut res, &other.0, self.0[i]);
+            }
+        }
+
+        let (_, r) = U512(res).divrem(modulo);
+        *self = r;
+    }
+
+    /// Multiply `self` by `other` (mod `modulo`)
+    pub fn mul(&mut self, other: &U256, modulo: &U256) {
+        #[cfg(target_os = "zkvm")]
+        {
+            unsafe {
+                zkm_lib::sys_bigint(
+                    (&mut self.0) as *mut [u128; 2] as *mut [u32; 8],
+                    0,
+                    (&self.0) as *const [u128; 2] as *const [u32; 8],
+                    (&other.0) as *const [u128; 2] as *const [u32; 8],
+                    (&modulo.0) as *const [u128; 2] as *const [u32; 8],
+                );
+            }
+        }
+        #[cfg(not(target_os = "zkvm"))]
+        {
+            self.cpu_mul(other, modulo);
         }
     }
 
@@ -372,7 +412,11 @@ impl U256 {
     /// Return an Iterator<Item=bool> over all bits from
     /// MSB to LSB.
     pub fn bits(&self) -> BitIterator {
-        BitIterator { int: &self, n: 256 }
+        BitIterator { int: self, n: 256 }
+    }
+
+    pub const fn from_raw_unchecked(v: [u128; 2]) -> Self {
+        U256(v)
     }
 }
 
@@ -438,7 +482,7 @@ fn adc(a: u128, b: u128, carry: &mut u128) -> u128 {
 fn add_nocarry(a: &mut [u128; 2], b: &[u128; 2]) {
     let mut carry = 0;
 
-    for (a, b) in a.into_iter().zip(b.iter()) {
+    for (a, b) in a.iter_mut().zip(b.iter()) {
         *a = adc(*a, *b, &mut carry);
     }
 
@@ -461,7 +505,7 @@ fn sub_noborrow(a: &mut [u128; 2], b: &[u128; 2]) {
 
     let mut borrow = 0;
 
-    for (a, b) in a.into_iter().zip(b.iter()) {
+    for (a, b) in a.iter_mut().zip(b.iter()) {
         *a = sbb(*a, *b, &mut borrow);
     }
 
@@ -519,29 +563,6 @@ fn mac_digit(from_index: usize, acc: &mut [u128; 4], b: &[u128; 2], c: u128) {
     }
 
     debug_assert!(carry == 0);
-}
-
-#[inline]
-fn mul_reduce(this: &mut [u128; 2], by: &[u128; 2], modulus: &[u128; 2], inv: u128) {
-    // The Montgomery reduction here is based on Algorithm 14.32 in
-    // Handbook of Applied Cryptography
-    // <http://cacr.uwaterloo.ca/hac/about/chap14.pdf>.
-
-    let mut res = [0; 2 * 2];
-    unroll! {
-        for i in 0..2 {
-            mac_digit(i, &mut res, by, this[i]);
-        }
-    }
-
-    unroll! {
-        for i in 0..2 {
-            let k = inv.wrapping_mul(res[i]);
-            mac_digit(i, &mut res, modulus, k);
-        }
-    }
-
-    this.copy_from_slice(&res[2..]);
 }
 
 #[test]
@@ -782,4 +803,60 @@ fn testing_divrem() {
         assert!(c1.unwrap() < modulo);
         assert!(c0 < modulo);
     }
+}
+
+#[test]
+fn testing_mul() {
+    let mut b = U256::from([
+        0x7a17caa950ad28d7,
+        0x1f6ac17ae15521b9,
+        0x334bea4e696bd284,
+        0x2a1f6744ce179d8e,
+    ]);
+    let r_inv = U256::from([
+        0xed84884a014afa37,
+        0xeb2022850278edf8,
+        0xcf63e9cfb74492d9,
+        0x2e67157159e5c639,
+    ]);
+    let modulo = U256::from([
+        0x3c208c16d87cfd47,
+        0x97816a916871ca8d,
+        0xb85045b68181585d,
+        0x30644e72e131a029,
+    ]);
+    b.mul(&r_inv, &modulo);
+    assert_eq!(b, U256::from([3, 0, 0, 0]));
+}
+
+#[test]
+fn testing_mul2() {
+    let one = U256::from([
+        0xac96341c4ffffffb,
+        0x36fc76959f60cd29,
+        0x666ea36f7879462e,
+        0xe0a77c19a07df2f,
+    ]);
+    let mut r_inv = U256::from([
+        0xdc5ba0056db1194e,
+        0x90ef5a9e111ec87,
+        0xc8260de4aeb85d5d,
+        0x15ebf95182c5551c,
+    ]);
+    let modulo = U256::from([
+        0x43e1f593f0000001,
+        0x2833e84879b97091,
+        0xb85045b68181585d,
+        0x30644e72e131a029,
+    ]);
+    r_inv.mul(&one, &modulo);
+    assert_eq!(r_inv, U256::from([1, 0, 0, 0]));
+}
+
+#[test]
+fn test_from_slice() {
+    let lhs = U256::one();
+    let rhs = U256::from_slice(&[1]).unwrap();
+
+    assert_eq!(lhs, rhs);
 }
